@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=pinight
+GenericName=Display Warmth
+Comment=Control display warmth and brightness
+Exec=pinight
+Icon=preferences-desktop-display
+Categories=Utility;Settings;DesktopSettings;
+Terminal=false
+StartupNotify=false
+Keywords=warmth;brightness;bluelight;nightmode;redshift;gammastep;
