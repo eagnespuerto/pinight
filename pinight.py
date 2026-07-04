@@ -6,17 +6,23 @@ without needing pip. Works on X11 (default on 32-bit Pi OS) and Wayland.
 """
 from __future__ import annotations
 
+import atexit
 import json
+import logging
+import os
 import shutil
 import subprocess
 import sys
 import tkinter as tk
+import traceback
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 APP_NAME = "pinight"
 CONFIG_DIR = Path.home() / ".config" / APP_NAME
 CONFIG_FILE = CONFIG_DIR / "config.json"
+LOG_FILE = CONFIG_DIR / "pinight.log"
+PID_FILE = CONFIG_DIR / "pinight.pid"
 
 DEFAULTS = {
     "temperature": 6500,   # K, daylight
@@ -43,10 +49,16 @@ def load_config():
             data = json.loads(CONFIG_FILE.read_text())
             if isinstance(data, dict):
                 cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
-        except (json.JSONDecodeError, OSError):
-            pass
-    cfg["temperature"] = max(TEMP_MIN, min(TEMP_MAX, int(cfg["temperature"])))
-    cfg["brightness"] = max(BRIGHT_MIN, min(BRIGHT_MAX, float(cfg["brightness"])))
+        except (json.JSONDecodeError, OSError) as e:
+            logging.warning("config load failed: %s; using defaults", e)
+    try:
+        cfg["temperature"] = max(TEMP_MIN, min(TEMP_MAX, int(cfg["temperature"])))
+    except (TypeError, ValueError):
+        cfg["temperature"] = DEFAULTS["temperature"]
+    try:
+        cfg["brightness"] = max(BRIGHT_MIN, min(BRIGHT_MAX, float(cfg["brightness"])))
+    except (TypeError, ValueError):
+        cfg["brightness"] = DEFAULTS["brightness"]
     cfg["enabled"] = bool(cfg["enabled"])
     return cfg
 
@@ -56,18 +68,98 @@ def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
+def setup_logging():
+    """File logging to ~/.config/pinight/pinight.log + INFO+ to stderr."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(str(LOG_FILE))
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    fh.setLevel(logging.DEBUG)
+    root.addHandler(fh)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    sh.setLevel(logging.INFO)
+    root.addHandler(sh)
+
+
+def install_excepthook():
+    def _hook(exctype, value, tb):
+        logging.critical(
+            "uncaught exception:\n%s",
+            "".join(traceback.format_exception(exctype, value, tb)),
+        )
+        sys.__excepthook__(exctype, value, tb)
+    sys.excepthook = _hook
+
+
+def acquire_single_instance_lock():
+    """Refuse to start a second GUI instance. Returns True on success."""
+    if PID_FILE.exists():
+        try:
+            old = int(PID_FILE.read_text().strip())
+        except (OSError, ValueError):
+            old = -1
+        if old > 0 and old != os.getpid():
+            try:
+                os.kill(old, 0)
+                logging.error("another pinight is running (PID %d); exiting", old)
+                return False
+            except OSError:
+                logging.info("stale PID file (PID %d dead); clearing", old)
+    try:
+        PID_FILE.write_text(str(os.getpid()))
+    except OSError as e:
+        logging.warning("cannot write PID file %s: %s", PID_FILE, e)
+    atexit.register(release_single_instance_lock)
+    return True
+
+
+def release_single_instance_lock():
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        if pid == os.getpid():
+            PID_FILE.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        pass
+
+
 def apply_settings(backend, temperature, brightness):
-    subprocess.run(
-        [backend, "-P", "-O", str(int(temperature)), "-b", f"{float(brightness):.2f}"],
-        check=False, capture_output=True, timeout=5,
-    )
+    cmd = [backend, "-P", "-O", str(int(temperature)), "-b", f"{float(brightness):.2f}"]
+    logging.debug("apply_settings: %s", " ".join(cmd))
+    try:
+        r = subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        logging.error("apply_settings TIMED OUT after 5s")
+        return
+    except FileNotFoundError as e:
+        logging.error("apply_settings: backend not found: %s", e)
+        return
+    if r.returncode != 0:
+        logging.warning(
+            "apply_settings rc=%d stderr=%s",
+            r.returncode, r.stderr.decode(errors="replace").strip(),
+        )
 
 
 def reset_display(backend):
-    subprocess.run(
-        [backend, "-x"],
-        check=False, capture_output=True, timeout=5,
-    )
+    cmd = [backend, "-x"]
+    logging.debug("reset_display: %s", " ".join(cmd))
+    try:
+        r = subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        logging.error("reset_display TIMED OUT after 5s")
+        return
+    except FileNotFoundError as e:
+        logging.error("reset_display: backend not found: %s", e)
+        return
+    if r.returncode != 0:
+        logging.warning(
+            "reset_display rc=%d stderr=%s",
+            r.returncode, r.stderr.decode(errors="replace").strip(),
+        )
 
 
 class PinightApp:
@@ -76,9 +168,11 @@ class PinightApp:
         self.backend = backend
         self.config = load_config()
         self._debounce_job = None
+        logging.info("PinightApp init backend=%s config=%s", backend, self.config)
 
         root.title("pinight")
         root.resizable(False, False)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
 
@@ -186,6 +280,13 @@ class PinightApp:
         save_config(self.config)
 
     def _on_close(self):
+        logging.info("close requested")
+        if self._debounce_job is not None:
+            try:
+                self.root.after_cancel(self._debounce_job)
+            except tk.TclError:
+                pass
+            self._debounce_job = None
         self._persist()
         self.root.destroy()
 
@@ -194,20 +295,33 @@ def cmd_apply_saved():
     """Headless: apply saved settings and exit. Used by autostart."""
     backend = find_backend()
     if not backend:
+        logging.error("no backend found (need redshift or gammastep)")
         return 1
     cfg = load_config()
+    logging.info("apply-saved: backend=%s config=%s", backend, cfg)
     if cfg["enabled"]:
         apply_settings(backend, cfg["temperature"], cfg["brightness"])
     return 0
 
 
 def main():
+    setup_logging()
+    install_excepthook()
+    logging.info("pinight starting argv=%s pid=%d", sys.argv, os.getpid())
+
     if "--apply-saved" in sys.argv:
-        return cmd_apply_saved()
+        rc = cmd_apply_saved()
+        logging.info("--apply-saved done rc=%d", rc)
+        return rc
+
+    if not acquire_single_instance_lock():
+        sys.stderr.write("pinight is already running. Exiting.\n")
+        return 2
 
     backend = find_backend()
     root = tk.Tk()
     if not backend:
+        logging.error("no backend found (need redshift or gammastep)")
         root.withdraw()
         messagebox.showerror(
             "pinight",
@@ -216,8 +330,13 @@ def main():
         )
         return 1
 
-    PinightApp(root, backend)
-    root.mainloop()
+    try:
+        PinightApp(root, backend)
+        logging.info("entering mainloop")
+        root.mainloop()
+        logging.info("mainloop exited normally")
+    finally:
+        logging.info("pinight exiting pid=%d", os.getpid())
     return 0
 
 
