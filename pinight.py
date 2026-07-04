@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
 """pinight — GUI control for display warmth and brightness on Raspberry Pi OS.
 
-Wraps redshift/gammastep. Stdlib only (Tkinter) so it runs on ARMv6 (Pi Zero)
-without needing pip. Works on X11 (default on 32-bit Pi OS) and Wayland.
+Backends (auto-detected in this order):
+  1. xrandr  — X11, no location provider or DBus; most reliable on Pi OS.
+  2. redshift — X11 fallback; invoked with -m randr -l manual:0:0 to skip
+                 location detection (redshift's GeoClue2 path hangs on some
+                 minimal Debian setups even in one-shot mode).
+  3. gammastep — Wayland.
+
+All backend commands run in a background worker thread so the Tk main
+loop never blocks on a hung subprocess. Only the most-recently-requested
+state is applied — rapid slider drags collapse to a single apply.
+
+Stdlib only (Tkinter + threading) so it runs on ARMv6 (Pi Zero).
 """
 from __future__ import annotations
 
 import atexit
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import tkinter as tk
 import traceback
 from pathlib import Path
@@ -25,22 +37,19 @@ LOG_FILE = CONFIG_DIR / "pinight.log"
 PID_FILE = CONFIG_DIR / "pinight.pid"
 
 DEFAULTS = {
-    "temperature": 6500,   # K, daylight
-    "brightness": 1.0,     # 0.3..1.0, software gamma scaling
+    "temperature": 6500,
+    "brightness": 1.0,
     "enabled": False,
 }
 
 TEMP_MIN, TEMP_MAX = 2500, 6500
 BRIGHT_MIN, BRIGHT_MAX = 0.3, 1.0
-DEBOUNCE_MS = 120
+SUBPROCESS_TIMEOUT = 2  # seconds; redshift/xrandr normally finish in <100ms
 
 
-def find_backend():
-    for name in ("redshift", "gammastep"):
-        if shutil.which(name):
-            return name
-    return None
-
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
 
 def load_config():
     cfg = dict(DEFAULTS)
@@ -69,7 +78,6 @@ def save_config(cfg):
 
 
 def setup_logging():
-    """File logging to ~/.config/pinight/pinight.log + INFO+ to stderr."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     for h in list(root.handlers):
@@ -96,7 +104,6 @@ def install_excepthook():
 
 
 def acquire_single_instance_lock():
-    """Refuse to start a second GUI instance. Returns True on success."""
     if PID_FILE.exists():
         try:
             old = int(PID_FILE.read_text().strip())
@@ -126,49 +133,222 @@ def release_single_instance_lock():
         pass
 
 
-def apply_settings(backend, temperature, brightness):
-    cmd = [backend, "-P", "-O", str(int(temperature)), "-b", f"{float(brightness):.2f}"]
-    logging.debug("apply_settings: %s", " ".join(cmd))
+def _run(cmd, timeout=SUBPROCESS_TIMEOUT):
+    """Run a subprocess with logging. Never raises."""
+    logging.debug("run: %s", " ".join(cmd))
     try:
-        r = subprocess.run(cmd, check=False, capture_output=True, timeout=5)
+        r = subprocess.run(cmd, check=False, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        logging.error("apply_settings TIMED OUT after 5s")
-        return
+        logging.error("TIMED OUT after %ss: %s", timeout, " ".join(cmd))
+        return None
     except FileNotFoundError as e:
-        logging.error("apply_settings: backend not found: %s", e)
-        return
+        logging.error("not found: %s", e)
+        return None
     if r.returncode != 0:
         logging.warning(
-            "apply_settings rc=%d stderr=%s",
-            r.returncode, r.stderr.decode(errors="replace").strip(),
+            "rc=%d cmd=%s stderr=%s",
+            r.returncode, " ".join(cmd),
+            r.stderr.decode(errors="replace").strip(),
         )
+    return r
 
 
-def reset_display(backend):
-    cmd = [backend, "-x"]
-    logging.debug("reset_display: %s", " ".join(cmd))
-    try:
-        r = subprocess.run(cmd, check=False, capture_output=True, timeout=5)
-    except subprocess.TimeoutExpired:
-        logging.error("reset_display TIMED OUT after 5s")
-        return
-    except FileNotFoundError as e:
-        logging.error("reset_display: backend not found: %s", e)
-        return
-    if r.returncode != 0:
-        logging.warning(
-            "reset_display rc=%d stderr=%s",
-            r.returncode, r.stderr.decode(errors="replace").strip(),
-        )
+# ---------------------------------------------------------------------------
+# Color temperature → RGB gamma (Tanner Helland approximation)
+# ---------------------------------------------------------------------------
 
+def kelvin_to_rgb(temp_k):
+    """Return (r, g, b) in [0, 1] normalized so the max channel is 1.0."""
+    t = temp_k / 100.0
+    if t <= 66:
+        r = 255.0
+    else:
+        r = 329.698727446 * ((t - 60) ** -0.1332047592)
+    if t <= 66:
+        g = 99.4708025861 * math.log(max(t, 1)) - 161.1195681661
+    else:
+        g = 288.1221695283 * ((t - 60) ** -0.0755148492)
+    if t >= 66:
+        b = 255.0
+    elif t <= 19:
+        b = 0.0
+    else:
+        b = 138.5177312231 * math.log(t - 10) - 305.0447927307
+    r = max(0.0, min(255.0, r)) / 255.0
+    g = max(0.0, min(255.0, g)) / 255.0
+    b = max(0.0, min(255.0, b)) / 255.0
+    return r, g, b
+
+
+# ---------------------------------------------------------------------------
+# Backends
+# ---------------------------------------------------------------------------
+
+class Backend:
+    name = ""
+
+    def apply(self, temperature, brightness):
+        raise NotImplementedError
+
+    def reset(self):
+        raise NotImplementedError
+
+
+class XrandrBackend(Backend):
+    """X11 backend using xrandr --brightness and --gamma. No DBus, no location."""
+
+    name = "xrandr"
+
+    def __init__(self, outputs):
+        self.outputs = outputs
+
+    @classmethod
+    def detect(cls):
+        if not shutil.which("xrandr"):
+            return None
+        try:
+            r = subprocess.run(
+                ["xrandr", "--current"],
+                check=False, capture_output=True, timeout=SUBPROCESS_TIMEOUT,
+                text=True,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return None
+        outputs = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "connected":
+                outputs.append(parts[0])
+        if not outputs:
+            return None
+        logging.info("xrandr backend: outputs=%s", outputs)
+        return cls(outputs)
+
+    def apply(self, temperature, brightness):
+        r, g, b = kelvin_to_rgb(temperature)
+        gamma = f"{r:.3f}:{g:.3f}:{b:.3f}"
+        bstr = f"{float(brightness):.2f}"
+        for out in self.outputs:
+            _run(["xrandr", "--output", out,
+                  "--brightness", bstr, "--gamma", gamma])
+
+    def reset(self):
+        for out in self.outputs:
+            _run(["xrandr", "--output", out,
+                  "--brightness", "1.0", "--gamma", "1.0:1.0:1.0"])
+
+
+class RedshiftBackend(Backend):
+    """Fallback. -m randr forces X11 method; -l manual:0:0 skips GeoClue2."""
+
+    name = "redshift"
+
+    @classmethod
+    def detect(cls):
+        return cls() if shutil.which("redshift") else None
+
+    def apply(self, temperature, brightness):
+        _run([
+            "redshift", "-m", "randr", "-l", "manual:0:0",
+            "-P", "-O", str(int(temperature)), "-b", f"{float(brightness):.2f}",
+        ])
+
+    def reset(self):
+        _run(["redshift", "-x"])
+
+
+class GammastepBackend(Backend):
+    """Wayland fallback."""
+
+    name = "gammastep"
+
+    @classmethod
+    def detect(cls):
+        return cls() if shutil.which("gammastep") else None
+
+    def apply(self, temperature, brightness):
+        _run([
+            "gammastep", "-P", "-O", str(int(temperature)),
+            "-b", f"{float(brightness):.2f}",
+        ])
+
+    def reset(self):
+        _run(["gammastep", "-x"])
+
+
+def find_backend():
+    for cls in (XrandrBackend, RedshiftBackend, GammastepBackend):
+        b = cls.detect()
+        if b is not None:
+            return b
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Worker thread: applies desired state in the background
+# ---------------------------------------------------------------------------
+
+class BackendWorker:
+    """Applies the LATEST requested state in a background thread.
+
+    Requests are coalesced: if the user drags a slider quickly, only the
+    final position is applied. This means Tk's main loop never waits on
+    a subprocess, and a hung backend can't queue up work.
+    """
+
+    def __init__(self, backend):
+        self.backend = backend
+        self._desired = None      # (temp, bright, enabled) or None
+        self._current = None
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._stop = False
+        self._thread = threading.Thread(target=self._loop,
+                                        name="pinight-backend", daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop:
+            self._event.wait()
+            self._event.clear()
+            if self._stop:
+                break
+            with self._lock:
+                target = self._desired
+            if target is None or target == self._current:
+                continue
+            temp, bright, enabled = target
+            try:
+                if enabled:
+                    self.backend.apply(temp, bright)
+                else:
+                    self.backend.reset()
+                self._current = target
+            except Exception:
+                logging.exception("backend action failed")
+
+    def request(self, temperature, brightness, enabled):
+        with self._lock:
+            self._desired = (int(temperature), float(brightness), bool(enabled))
+        self._event.set()
+
+    def stop(self):
+        self._stop = True
+        self._event.set()
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
 
 class PinightApp:
     def __init__(self, root, backend):
         self.root = root
         self.backend = backend
+        self.worker = BackendWorker(backend)
         self.config = load_config()
-        self._debounce_job = None
-        logging.info("PinightApp init backend=%s config=%s", backend, self.config)
+        logging.info("PinightApp init backend=%s config=%s",
+                     backend.name, self.config)
 
         root.title("pinight")
         root.resizable(False, False)
@@ -176,8 +356,12 @@ class PinightApp:
 
         self._build_ui()
 
-        if self.config["enabled"]:
-            apply_settings(backend, self.config["temperature"], self.config["brightness"])
+        # Push loaded state to worker; it'll apply if enabled.
+        self.worker.request(
+            self.config["temperature"],
+            self.config["brightness"],
+            self.config["enabled"],
+        )
 
     def _build_ui(self):
         frm = ttk.Frame(self.root, padding=16)
@@ -186,7 +370,7 @@ class PinightApp:
         self.enabled_var = tk.BooleanVar(value=self.config["enabled"])
         ttk.Checkbutton(
             frm, text="Enable warmth and dimming", variable=self.enabled_var,
-            command=self._on_toggle,
+            command=self._on_change,
         ).grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Separator(frm, orient="horizontal").grid(
@@ -199,7 +383,7 @@ class PinightApp:
         self.temp_label.grid(row=2, column=1, sticky="e")
         ttk.Scale(
             frm, from_=TEMP_MIN, to=TEMP_MAX, orient="horizontal", length=340,
-            variable=self.temp_var, command=self._on_temp,
+            variable=self.temp_var, command=self._on_change,
         ).grid(row=3, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             frm, text=f"warm {TEMP_MIN} K   <->   {TEMP_MAX} K daylight",
@@ -212,7 +396,7 @@ class PinightApp:
         self.bright_label.grid(row=5, column=1, sticky="e", pady=(14, 0))
         ttk.Scale(
             frm, from_=BRIGHT_MIN, to=BRIGHT_MAX, orient="horizontal", length=340,
-            variable=self.bright_var, command=self._on_bright,
+            variable=self.bright_var, command=self._on_change,
         ).grid(row=6, column=0, columnspan=2, sticky="ew")
         ttk.Label(
             frm, text=f"dim {BRIGHT_MIN:.1f}   <->   {BRIGHT_MAX:.1f} full  (software gamma)",
@@ -224,7 +408,8 @@ class PinightApp:
         ttk.Button(btns, text="Reset defaults", command=self._on_reset).pack(side="left")
         ttk.Button(btns, text="Save and close", command=self._on_close).pack(side="right")
 
-        ttk.Label(frm, text=f"backend: {self.backend}", foreground="#888").grid(
+        ttk.Label(frm, text=f"backend: {self.backend.name}",
+                  foreground="#888").grid(
             row=9, column=0, columnspan=2, sticky="w", pady=(12, 0)
         )
 
@@ -234,42 +419,20 @@ class PinightApp:
         self.temp_label.config(text=f"{int(self.temp_var.get())} K")
         self.bright_label.config(text=f"{float(self.bright_var.get()):.2f}")
 
-    def _on_temp(self, _val):
+    def _on_change(self, *_args):
         self._update_labels()
-        self._debounced_apply()
-
-    def _on_bright(self, _val):
-        self._update_labels()
-        self._debounced_apply()
-
-    def _on_toggle(self):
-        if self.enabled_var.get():
-            self._apply_now()
-        else:
-            reset_display(self.backend)
-        self._persist()
-
-    def _debounced_apply(self):
-        if self._debounce_job is not None:
-            self.root.after_cancel(self._debounce_job)
-        self._debounce_job = self.root.after(DEBOUNCE_MS, self._apply_now)
-
-    def _apply_now(self):
-        self._debounce_job = None
-        if self.enabled_var.get():
-            apply_settings(
-                self.backend, int(self.temp_var.get()), float(self.bright_var.get())
-            )
+        # Push latest state; worker coalesces to the final value.
+        self.worker.request(
+            self.temp_var.get(),
+            self.bright_var.get(),
+            self.enabled_var.get(),
+        )
         self._persist()
 
     def _on_reset(self):
         self.temp_var.set(DEFAULTS["temperature"])
         self.bright_var.set(DEFAULTS["brightness"])
-        self._update_labels()
-        if self.enabled_var.get():
-            self._apply_now()
-        else:
-            self._persist()
+        self._on_change()
 
     def _persist(self):
         self.config = {
@@ -281,26 +444,25 @@ class PinightApp:
 
     def _on_close(self):
         logging.info("close requested")
-        if self._debounce_job is not None:
-            try:
-                self.root.after_cancel(self._debounce_job)
-            except tk.TclError:
-                pass
-            self._debounce_job = None
         self._persist()
+        self.worker.stop()
         self.root.destroy()
 
+
+# ---------------------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------------------
 
 def cmd_apply_saved():
     """Headless: apply saved settings and exit. Used by autostart."""
     backend = find_backend()
     if not backend:
-        logging.error("no backend found (need redshift or gammastep)")
+        logging.error("no backend available")
         return 1
     cfg = load_config()
-    logging.info("apply-saved: backend=%s config=%s", backend, cfg)
+    logging.info("apply-saved: backend=%s config=%s", backend.name, cfg)
     if cfg["enabled"]:
-        apply_settings(backend, cfg["temperature"], cfg["brightness"])
+        backend.apply(cfg["temperature"], cfg["brightness"])
     return 0
 
 
@@ -321,12 +483,15 @@ def main():
     backend = find_backend()
     root = tk.Tk()
     if not backend:
-        logging.error("no backend found (need redshift or gammastep)")
+        logging.error("no backend available (need xrandr, redshift, or gammastep)")
         root.withdraw()
         messagebox.showerror(
             "pinight",
-            "Neither redshift nor gammastep is installed.\n\n"
-            "Install with:\n    sudo apt install redshift",
+            "No display backend found.\n\n"
+            "Install one of:\n"
+            "  sudo apt install x11-xserver-utils   # xrandr (recommended)\n"
+            "  sudo apt install redshift\n"
+            "  sudo apt install gammastep",
         )
         return 1
 
