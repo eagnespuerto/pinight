@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -202,6 +203,13 @@ class XrandrBackend(Backend):
     def __init__(self, outputs):
         self.outputs = outputs
 
+    # An active output has geometry like "1920x1080+0+0" on its header line.
+    # A "connected" output without geometry has no CRTC and rejects --gamma
+    # with "need crtc to set gamma on".
+    _ACTIVE_RE = re.compile(
+        r"^(\S+)\s+connected\b.*?\b\d+x\d+\+\d+\+\d+"
+    )
+
     @classmethod
     def detect(cls):
         if not shutil.which("xrandr"):
@@ -214,15 +222,23 @@ class XrandrBackend(Backend):
             )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             return None
-        outputs = []
+        logging.debug("xrandr --current stdout:\n%s", r.stdout)
+        active = []
+        connected_all = []
         for line in r.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2 and parts[1] == "connected":
-                outputs.append(parts[0])
-        if not outputs:
+                connected_all.append(parts[0])
+            m = cls._ACTIVE_RE.match(line)
+            if m:
+                active.append(m.group(1))
+        logging.info("xrandr backend: connected=%s active=%s",
+                     connected_all, active)
+        if not active:
+            # Nothing to drive. Refuse — let the caller fall back to
+            # another backend rather than spam xrandr with bad calls.
             return None
-        logging.info("xrandr backend: outputs=%s", outputs)
-        return cls(outputs)
+        return cls(active)
 
     def apply(self, temperature, brightness):
         r, g, b = kelvin_to_rgb(temperature)
