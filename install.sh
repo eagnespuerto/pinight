@@ -24,7 +24,12 @@ mkdir -p "$BIN_DIR"
 install -m 755 pinight.py "$BIN_DIR/$APP_NAME"
 
 mkdir -p "$DESKTOP_DIR"
-install -m 644 pinight.desktop "$DESKTOP_DIR/$APP_NAME.desktop"
+# Substitute the absolute path into Exec= so the LXDE/PIXEL menu launcher
+# (which does not source ~/.profile, so ~/.local/bin is not on its PATH)
+# can still find the binary.
+sed "s|^Exec=pinight\$|Exec=$BIN_DIR/$APP_NAME|" pinight.desktop \
+    > "$DESKTOP_DIR/$APP_NAME.desktop"
+chmod 644 "$DESKTOP_DIR/$APP_NAME.desktop"
 
 mkdir -p "$AUTOSTART_DIR"
 cat > "$AUTOSTART_DIR/$APP_NAME-apply.desktop" <<EOF
